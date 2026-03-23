@@ -6,6 +6,7 @@ import cv2
 import yt_dlp
 import numpy as np
 import httpx
+import uuid
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +15,9 @@ import threading
 import queue
 
 app = FastAPI()
+
+# Almacén temporal de URLs de audio por sesión (evita pasar URLs de YouTube por el cliente)
+audio_sessions = {}
 
 # Middleware para log de todas las requests
 @app.middleware("http")
@@ -1271,10 +1275,10 @@ HTML_CONTENT = """
                                 videoNativeFps = msg.native_fps;
                                 log(`FPS nativo detectado: ${msg.native_fps}`);
                             }
-                            if (msg.audio_url) {
-                                // Usar URL directa de YouTube (el proxy no funciona)
-                                const audioSrc = msg.audio_url;
-                                log('[Audio] URL directa: ' + audioSrc.substring(0, 60) + '...');
+                            if (msg.audio_session_id) {
+                                // Usar el proxy local con session_id (la URL de audio se queda en el servidor)
+                                const audioSrc = '/proxy-audio?session_id=' + msg.audio_session_id;
+                                log('[Audio] Proxy session: ' + msg.audio_session_id);
                                 
                                 audioReadyTime = Date.now();
                                 const ap = document.getElementById('audio-player');
@@ -1336,7 +1340,7 @@ HTML_CONTENT = """
             };
 
             ws.onerror = () => { showError('Error de conexión WebSocket'); stopStream(); };
-            ws.onclose = (e) => { if (isPlaying) stopStream(); };
+            ws.onclose = (e) => { if (isPlaying) stopStream(false); };
 
             isPlaying = true;
         }
@@ -1347,16 +1351,20 @@ HTML_CONTENT = """
             if (ws) { ws.close(); ws = null; }
             if (fpsInterval) { clearInterval(fpsInterval); fpsInterval = null; }
 
-            const audioPlayer = document.getElementById('audio-player');
-            audioPlayer.pause();
-            audioPlayer.src = '';
-            pendingAudioUrl = null;
-            audioReadyTime = null;
-            audioActivating = false;
-            audioPrepared = false;
-            firstFrameTime = null;
-            if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
-            latestVideoPts = null;
+            // Solo matar el audio en parada manual (reset=true)
+            // Cuando el video termina naturalmente, dejar que el audio siga sonando
+            if (reset) {
+                const audioPlayer = document.getElementById('audio-player');
+                audioPlayer.pause();
+                audioPlayer.src = '';
+                pendingAudioUrl = null;
+                audioReadyTime = null;
+                audioActivating = false;
+                audioPrepared = false;
+                firstFrameTime = null;
+                if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
+                latestVideoPts = null;
+            }
 
             document.getElementById('start-btn').style.display = 'block';
             document.getElementById('stop-btn').style.display = 'none';
@@ -1488,6 +1496,8 @@ class VideoStreamProcessor:
         
         video_url = None
         audio_url = None
+        audio_http_headers = {}  # headers HTTP necesarios para descargar el audio
+        audio_mime = 'audio/webm'  # MIME type del audio
         width = 0
         height = 0
         native_fps = 0
@@ -1497,6 +1507,9 @@ class VideoStreamProcessor:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(youtube_url, download=False)
                 print("yt-dlp extraction complete")
+                
+                # Obtener headers HTTP por defecto de yt-dlp
+                default_headers = ydl.params.get('http_headers', {})
                 
                 if 'requested_formats' in info:
                     for f in info['requested_formats']:
@@ -1508,10 +1521,21 @@ class VideoStreamProcessor:
                             print(f"Video URL found: {video_url[:30]}... fps={native_fps}")
                         if f.get('acodec') != 'none':
                             audio_url = f['url']
-                            print(f"Audio URL found: {audio_url[:30]}...")
+                            # Extraer headers HTTP específicos del formato de audio
+                            audio_http_headers = f.get('http_headers', default_headers) or default_headers
+                            audio_mime = f.get('ext', 'webm')
+                            if audio_mime == 'webm':
+                                audio_mime = 'audio/webm'
+                            elif audio_mime == 'm4a':
+                                audio_mime = 'audio/mp4'
+                            else:
+                                audio_mime = f'audio/{audio_mime}'
+                            print(f"Audio URL found: {audio_url[:30]}... mime={audio_mime}")
+                            print(f"Audio HTTP headers keys: {list(audio_http_headers.keys())}")
                 else:
                     video_url = info['url']
                     audio_url = info['url']
+                    audio_http_headers = info.get('http_headers', default_headers) or default_headers
                     width = info.get('width', 0)
                     height = info.get('height', 0)
                     native_fps = info.get('fps') or 0
@@ -1521,7 +1545,7 @@ class VideoStreamProcessor:
             print(f"Error extracting stream info: {e}")
             raise e
             
-        return video_url, audio_url, width, height, native_fps
+        return video_url, audio_url, audio_http_headers, audio_mime, width, height, native_fps
     
     def _put_frame_jpeg(self, jpeg_bytes):
         """Encola un frame JPEG, descartando si la cola está llena."""
@@ -1534,17 +1558,23 @@ class VideoStreamProcessor:
         """Procesa frames en thread separado, con fallback a ffmpeg."""
         import subprocess, time
 
-        # Primero intentar con cv2 (funciona con URLs directas de MP4)
+        # Intentar cv2 pero verificar que realmente puede leer al menos un frame
         cap = cv2.VideoCapture(video_url)
         if cap.isOpened():
-            print("cv2.VideoCapture abierto correctamente")
-            self._process_frames_cv2(cap, settings)
+            ret, first_frame = cap.read()
+            if ret and first_frame is not None:
+                print("cv2.VideoCapture abierto correctamente")
+                self._process_frames_cv2(cap, settings, first_frame=first_frame)
+            else:
+                cap.release()
+                print("cv2 abrio la URL pero fallo al leer frames, usando ffmpeg...")
+                self._process_frames_ffmpeg(video_url, settings)
         else:
             cap.release()
             print("cv2 no pudo abrir la URL, usando ffmpeg como decodificador de frames...")
             self._process_frames_ffmpeg(video_url, settings)
 
-    def _process_frames_cv2(self, cap, settings):
+    def _process_frames_cv2(self, cap, settings, first_frame=None):
         """Decodifica frames usando cv2 (para URLs directas de MP4)."""
         import time
         try:
@@ -1552,8 +1582,15 @@ class VideoStreamProcessor:
             frame_count = 0
             skip = settings.get('frame_skip', 1)
 
+            # Si se leyó un frame de prueba antes, procesarlo primero
+            pending_frame = first_frame
+
             while self.active:
-                ret, frame = cap.read()
+                if pending_frame is not None:
+                    ret, frame = True, pending_frame
+                    pending_frame = None
+                else:
+                    ret, frame = cap.read()
                 if not ret:
                     print("cv2: fin de stream o error de lectura")
                     break
@@ -1729,67 +1766,43 @@ async def home():
     return HTML_CONTENT
 
 @app.get("/proxy-audio")
-async def proxy_audio(url: str):
-    """Usa ffmpeg para transcodificar el audio a MP3 y servirlo como stream continuo."""
+async def proxy_audio(session_id: str):
+    """Proxy de audio: usa yt-dlp para descargar y ffmpeg para convertir a MP3.
+    yt-dlp maneja toda la autenticación de YouTube internamente."""
     print(f"[proxy-audio] ========== REQUEST RECIBIDO ==========")
-    print(f"[proxy-audio] URL: {url[:100]}...")
+    print(f"[proxy-audio] Session ID: {session_id}")
     
-    # Flags extra para manifiestos DASH/HLS
-    is_manifest = 'manifest' in url or '.m3u8' in url or 'googlevideo.com' in url
-    extra_flags = ['-allowed_extensions', 'ALL'] if is_manifest else []
+    session = audio_sessions.get(session_id)
+    if not session:
+        print(f"[proxy-audio] ✗ Session no encontrada: {session_id}")
+        raise HTTPException(status_code=404, detail="Audio session not found")
     
-    # Headers necesarios para YouTube
-    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-
-    cmd = [
-        'ffmpeg', '-loglevel', 'info',
-        '-user_agent', user_agent,
-        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-        *extra_flags,
-        '-i', url,
-        '-vn',
-        '-c:a', 'libmp3lame', '-b:a', '128k', '-ar', '44100',
-        '-f', 'mp3', 'pipe:1'
-    ]
-
-    print(f"[proxy-audio] CMD: ffmpeg -loglevel info -user_agent ... -i {url[:50]}...")
+    youtube_url = session['youtube_url']
+    print(f"[proxy-audio] YouTube URL: {youtube_url}")
 
     async def stream_generator():
-        print(f"[proxy-audio] Iniciando proceso ffmpeg...")
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        print(f"[proxy-audio] Proceso ffmpeg iniciado, PID: {proc.pid}")
+        q = session.get('queue')
+        if q is None:
+            print(f"[proxy-audio] ✗ No hay queue en la session")
+            return
         
         bytes_sent = 0
         first_chunk = True
+        print(f"[proxy-audio] Drenando queue pre-bufferizada...")
         try:
             while True:
-                chunk = await proc.stdout.read(8192)
-                if not chunk:
-                    print(f"[proxy-audio] EOF de ffmpeg stdout")
-                    stderr_out = await proc.stderr.read()
-                    if stderr_out:
-                        print(f"[proxy-audio] ffmpeg stderr: {stderr_out.decode('utf-8', errors='replace')[:800]}")
-                    print(f"[proxy-audio] Stream terminado. Bytes enviados: {bytes_sent}")
+                chunk = await q.get()
+                if chunk is None:  # señal de fin
                     break
-                
                 if first_chunk:
-                    print(f"[proxy-audio] ✓ Primer chunk recibido: {len(chunk)} bytes")
+                    print(f"[proxy-audio] ✓ Primer chunk: {len(chunk)} bytes (pre-bufferizado)")
                     first_chunk = False
-                
                 bytes_sent += len(chunk)
                 yield chunk
         except Exception as e:
-            print(f"[proxy-audio] Error: {e}")
+            print(f"[proxy-audio] Error al drear queue: {e}")
         finally:
-            try:
-                proc.terminate()
-                await proc.wait()
-            except Exception:
-                pass
+            print(f"[proxy-audio] Stream terminado. Bytes enviados: {bytes_sent}")
 
     return StreamingResponse(
         stream_generator(),
@@ -1808,7 +1821,7 @@ async def api_video_stream(url: str, resolution: int = 720):
     loop = asyncio.get_running_loop()
 
     try:
-        video_url, audio_url, width, height, native_fps = await loop.run_in_executor(
+        video_url, audio_url, _audio_headers, _audio_mime, width, height, native_fps = await loop.run_in_executor(
             None,
             processor.get_stream_info,
             url,
@@ -1906,7 +1919,7 @@ async def websocket_endpoint(websocket: WebSocket):
         loop = asyncio.get_running_loop()
         try:
             print("Invoking get_stream_info...")
-            video_url, audio_url, width, height, native_fps = await loop.run_in_executor(
+            video_url, audio_url, audio_http_headers, audio_mime, width, height, native_fps = await loop.run_in_executor(
                 None, 
                 processor.get_stream_info,
                 config['url'], 
@@ -1916,7 +1929,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if not video_url:
                 raise Exception("No se pudo obtener la URL del video")
             
-            print(f"Info extracted. Video: {video_url[:20]}... Audio: {audio_url[:20]}... FPS: {native_fps}")
+            print(f"Info extracted. Video: {video_url[:20]}... Audio: {audio_url[:20] if audio_url else 'None'}... FPS: {native_fps}")
 
         except Exception as e:
             print(f"Error in extraction loop: {e}")
@@ -1928,10 +1941,86 @@ async def websocket_endpoint(websocket: WebSocket):
         
         await websocket.send_json({'type': 'status', 'message': 'Conectando stream de video...'})
 
+        # Almacenar URL de YouTube original y arrancar el pipeline de audio YA
+        audio_session_id = None
+        if audio_url:
+            import shlex as _shlex
+            audio_session_id = str(uuid.uuid4())
+            audio_queue = asyncio.Queue(maxsize=100)  # buffer de chunks MP3
+            audio_sessions[audio_session_id] = {
+                'youtube_url': config['url'],
+                'queue': audio_queue,
+                'done': False,
+                'first_chunk_event': asyncio.Event(),  # se activa cuando llega el primer chunk
+            }
+            print(f"Audio session creada: {audio_session_id} -> {config['url']}")
+            
+            # Arrancar pipeline en background AHORA para pre-bufferear
+            _safe_url = _shlex.quote(config['url'])
+            _shell_cmd = (
+                f"yt-dlp -f bestaudio --no-warnings -o - {_safe_url} "
+                f"| ffmpeg -loglevel error -i pipe:0 -vn -c:a libmp3lame -b:a 128k -ar 44100 -f mp3 pipe:1"
+            )
+            
+            async def _prefetch_audio(sid, cmd, q):
+                proc = None
+                try:
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    print(f"[audio-prefetch] Pipeline iniciado PID={proc.pid}")
+                    while True:
+                        try:
+                            chunk = await proc.stdout.read(65536) # mayor chunk para eficiencia
+                            if not chunk:
+                                break
+                            await q.put(chunk)
+                            # Señalar que el primer chunk llegó
+                            if sid in audio_sessions and not audio_sessions[sid].get('first_chunk_event').is_set():
+                                audio_sessions[sid]['first_chunk_event'].set()
+                                print(f"[audio-prefetch] ✓ Primer chunk listo ({len(chunk)} bytes)")
+                        except asyncio.CancelledError:
+                            break
+                        except Exception as e:
+                            print(f"[audio-prefetch] Error en lectura: {e}")
+                            break
+                except Exception as ex:
+                    print(f"[audio-prefetch] Error fatal: {ex}")
+                finally:
+                    if proc:
+                        try:
+                            # Intentar terminar de forma limpia
+                            proc.terminate()
+                            await asyncio.wait_for(proc.wait(), timeout=2.0)
+                        except Exception:
+                            try: proc.kill()
+                            except: pass
+                    await q.put(None)  # señal de fin
+                    if sid in audio_sessions:
+                        audio_sessions[sid]['done'] = True
+                        audio_sessions[sid]['first_chunk_event'].set()  # desbloquear si hubo error
+                    print(f"[audio-prefetch] Pipeline finalizado para {sid}. Queue size: {q.qsize()}")
+            
+            asyncio.ensure_future(_prefetch_audio(audio_session_id, _shell_cmd, audio_queue))
+            
+            # Esperar a que el pipeline de audio produzca el primer chunk (máx 10s)
+            # Esto asegura que audio y video empiezan a la vez
+            first_chunk_event = audio_queue_session = audio_sessions[audio_session_id]['first_chunk_event']
+            print("[ws] Esperando primer chunk de audio antes de arrancar el video...")
+            try:
+                await asyncio.wait_for(first_chunk_event.wait(), timeout=10.0)
+                print("[ws] ✓ Audio listo, esperando 1s para que el navegador bufferee...")
+                await asyncio.sleep(1.0) # Delay de cortesía
+                print("[ws] ✓ Iniciando video sincronizado")
+            except asyncio.TimeoutError:
+                print("[ws] ⚠ Timeout esperando audio, arrancando video igualmente")
+
         await websocket.send_json({
             'type': 'info',
             'resolution': f'{width}x{height}',
-            'audio_url': audio_url,
+            'audio_session_id': audio_session_id,
             'native_fps': native_fps
         })
         
@@ -1987,8 +2076,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"[sync] Saltando {n} frames (pts={processor.current_pts:.1f}s)")
 
             try:
-                frame_data = processor.frame_queue.get(timeout=1.0)
+                # IMPORTANTE: usar run_in_executor para no bloquear el event loop.
+                # Un get() bloqueante impediría procesar las peticiones HTTP del proxy de audio.
+                frame_data = await loop.run_in_executor(
+                    None, 
+                    lambda: processor.frame_queue.get(timeout=1.0)
+                )
                 await websocket.send_bytes(frame_data)
+                
+                # DAR UN RESPIRO AL EVENT LOOP (Crítico para que el audio pueda entrar)
+                await asyncio.sleep(0.01) 
+
                 # Enviar PTS una vez por segundo
                 pts = processor.current_pts
                 if pts - last_pts_sent >= 1.0:
@@ -2019,6 +2117,14 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         if processor:
             processor.stop()  # libera cap/proc inmediatamente
+        # Limpiar sesión de audio con retraso (el proxy-audio HTTP puede seguir activo)
+        if audio_session_id:
+            async def delayed_cleanup(sid):
+                await asyncio.sleep(300)  # 5 minutos
+                if sid in audio_sessions:
+                    del audio_sessions[sid]
+                    print(f"Audio session eliminada (delayed): {sid}")
+            asyncio.ensure_future(delayed_cleanup(audio_session_id))
         try:
             await websocket.send_json({'type': 'complete'})
         except:
@@ -2028,4 +2134,4 @@ if __name__ == "__main__":
     import uvicorn
     print("🚀 Iniciando TeslaTube V1.0...")
     print("📺 Abre http://localhost:8001 en tu navegador")
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8002)

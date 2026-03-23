@@ -2134,4 +2134,4 @@ if __name__ == "__main__":
     import uvicorn
     print("🚀 Iniciando TeslaTube V1.0...")
     print("📺 Abre http://localhost:8001 en tu navegador")
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
